@@ -67,7 +67,8 @@ hasher2.update(chunk3); // Continue from where we left off
 
 | Feature | Description | Default |
 |---------|-------------|---------|
-| **Hash Methods** | MD5, SHA-256, SHA-512, CRC32, BLAKE3 | BLAKE3 |
+| **Hash Methods** | MD5, SHA-256, SHA-512, CRC32, CRC32C, BLAKE3 | BLAKE3 |
+| **S3 Composite Checksums** | CRC32C composite format for S3 multipart uploads | Via `CRC32C_S3` |
 | **Streaming** | Incremental hashing for large files | Supported |
 | **Resumability** | Save/restore hash state mid-operation | Opt-in via `{ resumable: true }` |
 | **Auto Engine Selection** | Uses fastest available engine per environment | Enabled |
@@ -109,12 +110,14 @@ The library automatically selects the best available hashing engine based on env
 
 ### Engine Priority
 
-| Environment | Resumable | SHA-256/512 | MD5 | BLAKE3/CRC32 |
-|-------------|-----------|-------------|-----|--------------|
+| Environment | Resumable | SHA-256/512 | MD5 | BLAKE3/CRC32/CRC32C |
+|-------------|-----------|-------------|-----|---------------------|
 | Node.js     | `false`   | node-native | node-native | wasm |
 | Node.js     | `true`    | wasm | wasm | wasm |
 | Browser     | `false`   | web-crypto | wasm | wasm |
 | Browser     | `true`    | wasm | wasm | wasm |
+
+> **Note:** CRC32C_S3 always uses WASM and is never resumable (it tracks per-chunk checksums, not streaming state).
 
 ### Checking the Engine
 
@@ -474,6 +477,14 @@ await hasher.digestAsync(); // OK
 | `node-native` | No | Node crypto doesn't expose internal state |
 | `web-crypto` | No | Web Crypto doesn't expose internal state |
 
+### Non-Resumable Methods
+
+| Method | Reason |
+|--------|--------|
+| `CRC32C_S3` | Tracks per-chunk checksums, not streaming state |
+
+> **Note:** Even with `{ resumable: true }`, CRC32C_S3 cannot be resumed because it doesn't maintain a streaming hash state.
+
 ### HashStateSnapshot Structure
 
 ```typescript
@@ -508,6 +519,152 @@ hasher2.load(base64State);
 // Continue hashing
 hasher2.update(chunk3);
 const finalHash = await hasher2.digestAsync();
+```
+
+---
+
+## S3 Checksums
+
+Amazon S3 uses CRC32C (Castagnoli polynomial) for integrity verification with a specific composite format for multipart uploads.
+
+### Understanding S3 Composite Checksums
+
+Unlike streaming hashes, S3's multipart checksum works differently:
+
+1. **Per-part checksum:** Each part has its own CRC32C (base64-encoded 4 bytes)
+2. **Composite checksum:** `base64(CRC32C(part1_crc || part2_crc || ...)) + "-" + partCount`
+3. **Example:** `"gVZk2w==-5"` = composite checksum `gVZk2w==` computed from 5 parts
+
+### Available S3 Methods
+
+| Method | Description | Use Case |
+|--------|-------------|----------|
+| `HashMethod.CRC32C_S3` | Streaming mode that tracks per-chunk CRC32C | Full file upload with integrity |
+| `Hasher.crc32cBase64(data)` | One-shot CRC32C returning base64 | Per-part checksum for S3 header |
+| `Hasher.computeS3CompositeChecksum(parts)` | Compute composite from checksums array | Verify/compute composite externally |
+
+### CRC32C_S3 Streaming Mode
+
+```typescript
+const hasher = new Hasher(HashMethod.CRC32C_S3);
+await hasher.open();
+
+// Each update() computes and stores per-chunk CRC32C
+hasher.update(chunk1);  // Stores base64 CRC32C for chunk 1
+hasher.update(chunk2);  // Stores base64 CRC32C for chunk 2
+hasher.update(chunk3);  // Stores base64 CRC32C for chunk 3
+
+// digest() computes composite from all stored checksums
+const result = hasher.digest();
+console.log(result.data.hash);       // "gVZk2w==-3"
+console.log(result.data.partsCount); // 3
+```
+
+### Per-Part Checksum for S3 Headers
+
+When uploading parts to S3, include the `ChecksumCRC32C` header:
+
+```typescript
+// Compute base64-encoded CRC32C for the S3 header
+const checksum = await Hasher.crc32cBase64(partData);
+
+// Use in S3 UploadPart request
+await s3.send(new UploadPartCommand({
+  // ... other params
+  ChecksumCRC32C: checksum,  // e.g., "gVZk2w=="
+}));
+```
+
+### Computing Composite from Existing Checksums
+
+If you already have per-part checksums (e.g., from S3 responses):
+
+```typescript
+const partChecksums = [
+  "abc123==",  // Part 1 CRC32C
+  "def456==",  // Part 2 CRC32C
+  "ghi789==",  // Part 3 CRC32C
+];
+
+const composite = await Hasher.computeS3CompositeChecksum(partChecksums);
+// Returns: "xyz000==-3"
+```
+
+### S3 Limitations
+
+| Limitation | Description |
+|------------|-------------|
+| **Not resumable** | CRC32C_S3 tracks per-chunk checksums, not streaming state |
+| **No one-shot mode** | `hashData(CRC32C_S3, data)` throws an error |
+| **Chunk = Part** | Each `update()` call = one S3 part |
+
+### Complete S3 Upload Example
+
+```typescript
+import { Hasher, HashMethod } from 'ref-hasher';
+import { S3Client, CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand } from '@aws-sdk/client-s3';
+
+async function uploadToS3WithIntegrity(file: File, bucket: string, key: string) {
+  const s3 = new S3Client({ region: 'us-east-1' });
+  const chunkSize = 8 * 1024 * 1024; // 8 MB minimum for S3 multipart
+
+  // Create multipart upload
+  const { UploadId } = await s3.send(new CreateMultipartUploadCommand({
+    Bucket: bucket,
+    Key: key,
+    ChecksumAlgorithm: 'CRC32C',
+  }));
+
+  // Track checksums for composite
+  const hasher = new Hasher(HashMethod.CRC32C_S3);
+  await hasher.open();
+
+  const parts = [];
+  let partNumber = 1;
+
+  for (let offset = 0; offset < file.size; offset += chunkSize) {
+    const chunk = await file.slice(offset, offset + chunkSize).arrayBuffer();
+    const data = new Uint8Array(chunk);
+
+    // Track for composite calculation
+    hasher.update(data);
+
+    // Get per-part checksum for S3 header
+    const partChecksum = await Hasher.crc32cBase64(data);
+
+    // Upload part with checksum
+    const { ETag, ChecksumCRC32C } = await s3.send(new UploadPartCommand({
+      Bucket: bucket,
+      Key: key,
+      UploadId,
+      PartNumber: partNumber,
+      Body: data,
+      ChecksumCRC32C: partChecksum,
+    }));
+
+    parts.push({ PartNumber: partNumber, ETag, ChecksumCRC32C });
+    partNumber++;
+  }
+
+  // Get our computed composite
+  const digestResult = hasher.digest();
+  const ourComposite = digestResult.data.hash;
+
+  // Complete multipart upload
+  const { ChecksumCRC32C: s3Composite } = await s3.send(new CompleteMultipartUploadCommand({
+    Bucket: bucket,
+    Key: key,
+    UploadId,
+    MultipartUpload: { Parts: parts },
+  }));
+
+  // Verify integrity
+  if (ourComposite !== s3Composite) {
+    throw new Error(`Checksum mismatch: local=${ourComposite}, s3=${s3Composite}`);
+  }
+
+  return { key, checksum: s3Composite };
+}
 ```
 
 ---
@@ -677,6 +834,61 @@ for (let i = startIndex; i < allChunks.length; i++) {
 
 ---
 
+### Using CRC32C_S3 Incorrectly
+
+**Symptoms:**
+- Error: "CRC32C_S3 requires streaming mode (open/update/digest)"
+- Error: "Cannot save state with wasm engine" (for S3 mode)
+
+**Cause:** CRC32C_S3 doesn't support one-shot hashing or resumability.
+
+**Solution:** Use streaming mode and don't attempt to save/load state:
+
+```typescript
+// Wrong: One-shot doesn't work for S3
+await Hasher.hashData(HashMethod.CRC32C_S3, data); // Error!
+
+// Wrong: Can't save/load S3 state
+const hasher = new Hasher(HashMethod.CRC32C_S3);
+await hasher.open();
+hasher.update(data);
+hasher.save(); // Error!
+
+// Correct: Use streaming mode
+const hasher = new Hasher(HashMethod.CRC32C_S3);
+await hasher.open();
+hasher.update(chunk1);
+hasher.update(chunk2);
+const result = hasher.digest(); // Returns composite checksum
+```
+
+---
+
+### Mismatched S3 Composite Checksum
+
+**Symptoms:**
+- S3 CompleteMultipartUpload returns different checksum than computed locally
+
+**Possible Causes:**
+
+| Cause | Solution |
+|-------|----------|
+| Different chunk sizes | Ensure chunk boundaries match S3 part boundaries |
+| Missed chunks | Verify every part was included in both calculations |
+| Wrong order | Checksums must be in part number order |
+
+**Debugging:**
+
+```typescript
+// Log each part's checksum to compare
+for (let i = 0; i < chunks.length; i++) {
+  const checksum = await Hasher.crc32cBase64(chunks[i]);
+  console.log(`Part ${i + 1}: ${checksum}`);
+}
+```
+
+---
+
 ## Performance Comparison
 
 Approximate relative performance (higher = faster):
@@ -688,8 +900,12 @@ Approximate relative performance (higher = faster):
 | MD5 | 100% | N/A | 50% |
 | BLAKE3 | N/A | N/A | 100% |
 | CRC32 | N/A | N/A | 100% |
+| CRC32C | N/A | N/A | 100% |
+| CRC32C_S3 | N/A | N/A | 100% |
 
 **Notes:**
 - BLAKE3 WASM is highly optimized and often faster than SHA-256 WASM
+- CRC32/CRC32C are very fast due to simple algorithm and small output
 - For maximum performance without resumability: SHA-256 (native/web-crypto)
 - For maximum performance with resumability: BLAKE3 (optimized WASM)
+- For S3 multipart uploads: CRC32C_S3 is required for composite checksums
