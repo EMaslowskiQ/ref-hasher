@@ -35,4 +35,5 @@ coverage/
 .yalc/
 yalc.lock
 
-CLAUDE.md
+*.md
+.claude/*
